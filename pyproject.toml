@@ -1,0 +1,16 @@
+[project]
+name = "rl-pruning"
+version = "0.1.0"
+dependencies = [
+	"torch",
+	"transformers",
+	"datasets",
+	"gymnasium",
+	"typer",
+	"tqdm",
+	"matplotlib",
+	"pandas",
+]
+requires-python = ">=3.10"
+[project.scripts]
+rl-pruning = "rl_pruning.cli:app"
