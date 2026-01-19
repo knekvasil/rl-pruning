@@ -3,6 +3,7 @@ import gymnasium as gym
 import torch
 import numpy as np
 import torch.nn as nn
+from rl_pruning.utils.priors import load_baseline_curve, compute_layer_importance
 
 
 class TransformerPruningEnv(gym.Env):
@@ -37,16 +38,21 @@ class TransformerPruningEnv(gym.Env):
         )
 
         # State = dynamic, per-layer only
-        # [layer_idx, ffn_ratio, head_ratio, param_ratio]
+        # [layer_idx, ffn_ratio, head_ratio, param_ratio, importance]
         self.observation_space = gym.spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(4,),
+            shape=(5,),
             dtype=np.float32,
         )
 
         self.original_params = self._count_parameters(self.model)
         self.original_accuracy = self.eval_fn(self.model)
+
+        # Baseline accuracy vs. compression (reward)
+        self.baseline_curve = load_baseline_curve()
+        # Layer importance priors
+        self.layer_importance = compute_layer_importance(self.original_model)
 
         self.reset()
 
@@ -79,18 +85,25 @@ class TransformerPruningEnv(gym.Env):
 
         # ---- reward ----
         if not self.done:
-            # proxy reward (NO accuracy eval here)
+            # proxy reward
             ffn_ratio, head_ratio = action
-            # REWARD: encourage compression, penalize extreme actions
-            reward = 2.0 * param_reduction - 0.1 * (ffn_ratio**2 + head_ratio**2)
+            # add layer importance to proxy reward
+            importance = self.layer_importance[self.current_layer]
 
+            reward = 2.0 * param_reduction - 0.1 * importance * (
+                ffn_ratio**2 + head_ratio**2
+            )
         else:
             # terminal reward only
             accuracy = self.eval_fn(self.model)
             total_param_ratio = current_params / self.original_params
-            # Make alpha more aggressive?
-            reward = (accuracy - self.original_accuracy) * 5.0
-            reward -= self.alpha * (1.0 - total_param_ratio) * 5.0
+            compression = 1.0 - total_param_ratio
+            expected_acc = self.expected_accuracy(compression)
+
+            # Scale with expected accuracy instead of original accuracy
+            reward = (accuracy - expected_acc) * 10.0
+            # Weaken compression penalty
+            reward -= 0.1 * compression
 
         return self._get_state(), float(reward), self.done, False, {}
 
@@ -119,9 +132,10 @@ class TransformerPruningEnv(gym.Env):
         )
 
         param_ratio = self._count_parameters(self.model) / self.original_params
+        importance = self.layer_importance[self.current_layer]
 
         return np.array(
-            [idx, ffn_ratio, head_ratio, param_ratio],
+            [idx, ffn_ratio, head_ratio, param_ratio, importance],
             dtype=np.float32,
         )
 
@@ -177,6 +191,12 @@ class TransformerPruningEnv(gym.Env):
         heads_to_prune = [h for h in range(old_heads) if h not in keep]
 
         layer.attention.prune_heads(heads_to_prune)
+
+    # --------------------- Helpers ---------------------
+
+    def expected_accuracy(self, compression):
+        xs, ys = zip(*sorted(self.baseline_curve.items()))
+        return np.interp(compression, xs, ys)
 
     # -------------------- Utilities --------------------
 
