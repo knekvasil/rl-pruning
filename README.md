@@ -13,14 +13,17 @@ The current implementation targets BERT on GLUE/SST-2, but the architecture is m
 ```
 rl-pruning/
 ├── rl_pruning/
+    ├── assets/               # Baselines
 │   ├── cli.py                # Typer CLI entrypoint
 │   ├── config.py             # Hyperparameter configs
 │   ├── envs/                 # Gym environments
 │   ├── eval/                 # GLUE evaluation
+│   ├── pruning/              # Uniform baseline pruning
+│   ├── scripts/              # Pre-compute baseline
 │   ├── models/               # PPO actor-critic
 │   ├── training/             # Training + checkpointing
 │   ├── analysis/             # Policy inspection + plots
-│   └── utils/                # Model loading, helpers
+│   └── utils/                # Model loading, helpers, priors
 ├── pyproject.toml
 └── README.md
 ```
