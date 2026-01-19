@@ -13,7 +13,7 @@ The current implementation targets BERT on GLUE/SST-2, but the architecture is m
 ```
 rl-pruning/
 ├── rl_pruning/
-    ├── assets/               # Baselines
+│   ├── assets/               # Baselines
 │   ├── cli.py                # Typer CLI entrypoint
 │   ├── config.py             # Hyperparameter configs
 │   ├── envs/                 # Gym environments
