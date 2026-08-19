@@ -3,7 +3,7 @@ import gymnasium as gym
 import torch
 import numpy as np
 import torch.nn as nn
-from rl_pruning.utils.priors import load_baseline_curve, compute_layer_importance
+from rl_pruning.utils.priors import compute_layer_importance
 
 
 class TransformerPruningEnv(gym.Env):
@@ -13,13 +13,19 @@ class TransformerPruningEnv(gym.Env):
         tokenizer,
         eval_fn,
         max_prune_ratio=0.8,
-        alpha=0.05,
+        alpha=0.3,
+        acc_floor_ratio=0.85,
+        shaping_coef=1.0,
+        shaping_penalty=0.1,
         device="cuda",
     ):
         super().__init__()
 
-        self.original_model = deepcopy(model).to(device)
-        self.model = deepcopy(model).to(device)
+        # Keep a pristine CPU template for cheap deepcopy in reset(); original_model
+        # stays on-device for dimension lookups in _get_state().
+        self._template = deepcopy(model)
+        self.original_model = deepcopy(self._template).to(device)
+        self.model = deepcopy(self._template).to(device)
         self.tokenizer = tokenizer
         self.eval_fn = eval_fn
         self.device = device
@@ -28,6 +34,9 @@ class TransformerPruningEnv(gym.Env):
         self.n_layers = len(self.layers)
         self.max_prune_ratio = max_prune_ratio
         self.alpha = alpha
+        self.acc_floor_ratio = acc_floor_ratio
+        self.shaping_coef = shaping_coef
+        self.shaping_penalty = shaping_penalty
 
         # Continuous action: prune ratio ∈ [0, max_prune_ratio]
         self.action_space = gym.spaces.Box(
@@ -46,11 +55,11 @@ class TransformerPruningEnv(gym.Env):
             dtype=np.float32,
         )
 
-        self.original_params = self._count_parameters(self.model)
+        # compute full param count via direct scan before the running cache exists
+        self._param_count = sum(p.numel() for p in self.model.parameters())
+        self.original_params = self._param_count
         self.original_accuracy = self.eval_fn(self.model)
 
-        # Baseline accuracy vs. compression (reward)
-        self.baseline_curve = load_baseline_curve()
         # Layer importance priors
         self.layer_importance = compute_layer_importance(self.original_model)
 
@@ -59,10 +68,11 @@ class TransformerPruningEnv(gym.Env):
     # -------------------- Core RL API --------------------
 
     def reset(self, *, seed=None, options=None):
-        self.model = deepcopy(self.original_model).to(self.device)
+        self.model = deepcopy(self._template).to(self.device)
         self.layers = self.model.bert.encoder.layer
         self.current_layer = 0
         self.done = False
+        self._param_count = self.original_params
         return self._get_state(), {}
 
     def step(self, action):
@@ -70,40 +80,37 @@ class TransformerPruningEnv(gym.Env):
 
         layer = self.layers[self.current_layer]
 
-        prev_params = self._count_parameters(self.model)
-
-        # ---- prune current layer ----
-        self._prune_layer(layer, action)
-
-        current_params = self._count_parameters(self.model)
-        param_reduction = (prev_params - current_params) / self.original_params
+        # ---- prune current layer (updates running _param_count) ----
+        removed = self._prune_layer(layer, action)
+        param_reduction = removed / self.original_params
 
         # ---- advance layer pointer ----
+        layer_idx = self.current_layer
         self.current_layer += 1
         if self.current_layer >= self.n_layers:
             self.done = True
 
         # ---- reward ----
         if not self.done:
-            # proxy reward
+            # proxy reward (shaping signal; no eval). Aligned to the terminal
+            # reward's compression term via shaping_coef.
             ffn_ratio, head_ratio = action
-            # add layer importance to proxy reward
-            importance = self.layer_importance[self.current_layer]
+            importance = self.layer_importance[layer_idx]
 
-            reward = 2.0 * param_reduction - 0.1 * importance * (
-                ffn_ratio**2 + head_ratio**2
+            reward = self.shaping_coef * param_reduction - self.shaping_penalty * (
+                importance * (ffn_ratio**2 + head_ratio**2)
             )
         else:
-            # terminal reward only
+            # terminal reward: maximize accuracy retention while compressing
             accuracy = self.eval_fn(self.model)
-            total_param_ratio = current_params / self.original_params
+            total_param_ratio = self._param_count / self.original_params
             compression = 1.0 - total_param_ratio
-            expected_acc = self.expected_accuracy(compression)
 
-            # Scale with expected accuracy instead of original accuracy
-            reward = (accuracy - expected_acc) * 10.0
-            # Weaken compression penalty
-            reward -= 0.1 * compression
+            retention = accuracy / self.original_accuracy
+            reward = retention - self.alpha * compression
+            # soft accuracy floor: strongly discourage catastrophic degradation
+            if retention < self.acc_floor_ratio:
+                reward -= 2.0
 
         return self._get_state(), float(reward), self.done, False, {}
 
@@ -113,7 +120,16 @@ class TransformerPruningEnv(gym.Env):
         idx = self.current_layer / self.n_layers if not self.done else 1.0
 
         if self.done:
-            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            return np.array(
+                [
+                    1.0,
+                    0.0,
+                    0.0,
+                    self._param_count / self.original_params,
+                    0.0,
+                ],
+                dtype=np.float32,
+            )
 
         layer = self.layers[self.current_layer]
 
@@ -131,7 +147,7 @@ class TransformerPruningEnv(gym.Env):
             ].attention.self.num_attention_heads
         )
 
-        param_ratio = self._count_parameters(self.model) / self.original_params
+        param_ratio = self._param_count / self.original_params
         importance = self.layer_importance[self.current_layer]
 
         return np.array(
@@ -145,8 +161,10 @@ class TransformerPruningEnv(gym.Env):
         ffn_ratio = float(np.clip(action[0], 0.0, self.max_prune_ratio))
         head_ratio = float(np.clip(action[1], 0.0, self.max_prune_ratio))
 
-        self._prune_ffn(layer, ffn_ratio)
-        self._prune_heads(layer, head_ratio)
+        removed = self._prune_ffn(layer, ffn_ratio)
+        removed += self._prune_heads(layer, head_ratio)
+        self._param_count -= removed
+        return removed
 
     def _prune_ffn(self, layer, ratio):
         fc1 = layer.intermediate.dense
@@ -155,7 +173,10 @@ class TransformerPruningEnv(gym.Env):
         old_dim = fc1.out_features
         new_dim = int(old_dim * (1.0 - ratio))
         if new_dim < 1 or new_dim == old_dim:
-            return
+            return 0
+
+        # Exact removed param count for the FFN block
+        removed = (old_dim - new_dim) * (fc1.in_features + 1 + fc2.out_features)
 
         # Importance-based neuron selection (L1 norm)
         scores = fc1.weight.abs().sum(dim=1)
@@ -172,6 +193,16 @@ class TransformerPruningEnv(gym.Env):
 
         layer.intermediate.dense = new_fc1
         layer.output.dense = new_fc2
+        return removed
+
+    def _count_attn_params(self, layer):
+        attn = layer.attention
+        total = 0
+        for lin in (attn.self.query, attn.self.key, attn.self.value, attn.output.dense):
+            total += lin.weight.numel()
+            if lin.bias is not None:
+                total += lin.bias.numel()
+        return total
 
     def _prune_heads(self, layer, ratio):
         attn = layer.attention.self
@@ -179,7 +210,9 @@ class TransformerPruningEnv(gym.Env):
         new_heads = int(old_heads * (1.0 - ratio))
 
         if new_heads < 1 or new_heads == old_heads:
-            return
+            return 0
+
+        before = self._count_attn_params(layer)
 
         # Head importance w/ output projection weight norms
         head_dim = attn.attention_head_size
@@ -192,15 +225,16 @@ class TransformerPruningEnv(gym.Env):
 
         layer.attention.prune_heads(heads_to_prune)
 
-    # --------------------- Helpers ---------------------
-
-    def expected_accuracy(self, compression):
-        xs, ys = zip(*sorted(self.baseline_curve.items()))
-        return np.interp(compression, xs, ys)
+        after = self._count_attn_params(layer)
+        return before - after
 
     # -------------------- Utilities --------------------
 
-    def _count_parameters(self, model):
+    def _count_parameters(self, model=None):
+        # When called with no arg (or the env's current model), return the
+        # cached running count updated incrementally by _prune_layer.
+        if model is None or model is self.model:
+            return self._param_count
         return sum(p.numel() for p in model.parameters())
 
 

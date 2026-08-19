@@ -1,22 +1,32 @@
 from tqdm import tqdm
+import time
+import numpy as np
 import torch
 import torch.optim as optim
 from .checkpointing import CheckpointManager
 from rl_pruning.models.ppo import PPOActorCritic
 
 
-def train_ppo(env, config, episodes: int, device: str):
+def train_ppo(
+    env,
+    config,
+    episodes: int,
+    device: str,
+    full_eval_fn=None,
+    eval_every: int = 10,
+):
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     max_action = env.action_space.high[0]
 
     # Hyperparameters
-    gamma = 0.99
-    lam = 0.95
-    clip = 0.2
-    entropy_coef = 0.05
-    value_coef = 0.5
-    lr = 3e-4
+    gamma = config.gamma
+    lam = config.lam
+    clip = config.clip
+    entropy_coef = config.entropy_coef
+    value_coef = config.value_coef
+    lr = config.lr
+    n_rollouts = config.n_rollouts
 
     net = PPOActorCritic(obs_dim, act_dim, max_action).to(device)
     opt = optim.Adam(net.parameters(), lr=lr)
@@ -30,51 +40,67 @@ def train_ppo(env, config, episodes: int, device: str):
     episode_rewards = []
     episode_accuracies = []
     episode_compressions = []
+    full_accuracies = []
 
     for episode in tqdm(range(episodes), desc="Training PPO"):
-        obs, _ = env.reset()
-        done = False
+        ep_start = time.time()
+        # Buffers accumulate transitions across all rollouts in this update
+        obs_buf, act_buf, logp_buf = [], [], []
+        adv_buf, ret_buf = [], []
 
-        # Buffers for trajectory collection
-        obs_buf, act_buf, logp_buf, rew_buf, val_buf = [], [], [], [], []
+        roll_rewards, roll_accs, roll_comps = [], [], []
 
-        # Layer-wise proxy reward tracking
-        layer_rewards = []
+        for _ in range(n_rollouts):
+            obs, _ = env.reset()
+            done = False
 
-        while not done:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-            action, logp, val = net.act(obs_t)
+            # Per-rollout trajectory buffers
+            r_obs, r_act, r_logp, r_rew, r_val = [], [], [], [], []
 
-            next_obs, reward, done, _, _ = env.step(action.cpu().numpy())
+            while not done:
+                obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+                action, u, logp, val = net.act(obs_t)
 
-            # Store transition
-            obs_buf.append(obs_t)
-            act_buf.append(action.detach())
-            logp_buf.append(logp.detach())
-            val_buf.append(val.detach())
+                next_obs, reward, done, _, _ = env.step(action.cpu().numpy())
 
-            rew_buf.append(torch.tensor(reward, device=device))
+                r_obs.append(obs_t)
+                r_act.append(u.detach())
+                r_logp.append(logp.detach())
+                r_val.append(val.detach())
+                r_rew.append(torch.tensor(reward, device=device))
 
-            # Proxy reward logging per layer
-            layer_idx = int(obs[0] * env.n_layers) if not done else env.n_layers - 1
-            layer_rewards.append((layer_idx, reward))
+                obs = next_obs
 
-            obs = next_obs
+            # -------- GAE over this trajectory --------
+            vals = r_val + [torch.tensor(0.0, device=device)]
+            adv, gae = [], 0.0
 
-        # -------- GAE Computation --------
-        vals = val_buf + [torch.tensor(0.0, device=device)]
-        adv, gae = [], 0.0
+            for t in reversed(range(len(r_rew))):
+                # Optional monotonic layer weighting (0 disables)
+                proxy_reward = r_rew[t] * (
+                    1.0 + config.layer_weight_decay * t / len(r_rew)
+                )
+                delta = proxy_reward + gamma * vals[t + 1] - vals[t]
+                gae = delta + gamma * lam * gae
+                adv.insert(0, gae)
 
-        for t in reversed(range(len(rew_buf))):
-            # Proxy reward: penalize early layers less heavily
-            proxy_reward = rew_buf[t] * (1.0 + 0.1 * t / len(rew_buf))
+            adv_t = torch.stack(adv)
+            ret_t = adv_t + torch.stack(r_val)
 
-            delta = proxy_reward + gamma * vals[t + 1] - vals[t]
-            gae = delta + gamma * lam * gae
-            adv.insert(0, gae)
+            # Accumulate into shared update batch
+            obs_buf += r_obs
+            act_buf += r_act
+            logp_buf += r_logp
+            adv_buf.append(adv_t)
+            ret_buf.append(ret_t)
 
-        adv = torch.stack(adv)
-        ret = adv + torch.stack(val_buf)
+            # Per-rollout metrics
+            roll_rewards.append(sum(r_rew).item())
+            roll_accs.append(env.eval_fn(env.model))
+            roll_comps.append(env._count_parameters(env.model) / env.original_params)
+
+        adv = torch.cat(adv_buf)
+        ret = torch.cat(ret_buf)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         # -------- PPO Update --------
@@ -83,7 +109,7 @@ def train_ppo(env, config, episodes: int, device: str):
         logp_old = torch.stack(logp_buf).detach()
 
         # Multi-epoch policy update
-        for epoch in range(4):  # TODO: +/-4?
+        for epoch in range(config.epochs):
             logp, entropy, value = net.evaluate(obs_batch, act_batch)
             ratio = (logp - logp_old).exp()
 
@@ -101,10 +127,15 @@ def train_ppo(env, config, episodes: int, device: str):
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
             opt.step()
 
-        # -------- Logging & Monitoring --------
-        final_reward = sum(rew_buf).item()
-        final_accuracy = env.eval_fn(env.model)
-        final_compression = env._count_parameters(env.model) / env.original_params
+        # -------- Logging & Monitoring (aggregate across rollouts) --------
+        final_reward = float(np.mean(roll_rewards))
+        final_accuracy = float(np.mean(roll_accs))
+        final_compression = float(np.mean(roll_comps))
+
+        full_accuracy = None
+        if full_eval_fn is not None and episode % eval_every == 0:
+            full_accuracy = full_eval_fn(env.model)
+            full_accuracies.append((episode, full_accuracy))
 
         episode_rewards.append(final_reward)
         episode_accuracies.append(final_accuracy)
@@ -123,12 +154,16 @@ def train_ppo(env, config, episodes: int, device: str):
             checkpoint_mgr.save_checkpoint(net, opt, episode)
 
         if episode % 10 == 0:
+            acc_str = f"Acc: {final_accuracy:.4f}"
+            if full_accuracy is not None:
+                acc_str += f" (full: {full_accuracy:.4f})"
             print(
                 f"\nEpisode {episode:3d} | "
                 f"Reward: {final_reward:7.4f} | "
-                f"Acc: {final_accuracy:.4f} | "
+                f"{acc_str} | "
                 f"Comp: {final_compression:.2%} | "
-                f"LR: {opt.param_groups[0]['lr']:.1e}"
+                f"LR: {opt.param_groups[0]['lr']:.1e} | "
+                f"Time: {time.time() - ep_start:.1f}s"
             )
 
     # Save final model
@@ -139,6 +174,7 @@ def train_ppo(env, config, episodes: int, device: str):
         "rewards": episode_rewards,
         "accuracies": episode_accuracies,
         "compressions": episode_compressions,
+        "full_accuracies": full_accuracies,
         "alpha": env.alpha,
     }
 

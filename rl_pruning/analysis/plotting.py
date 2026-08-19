@@ -18,6 +18,13 @@ def plot_training_curves(history, output_dir="training_output"):
         }
     )
 
+    # Full-eval accuracy (sparse, measured every eval_every episodes)
+    full_acc = history.get("full_accuracies", [])
+    if full_acc:
+        full_ep, full_vals = zip(*full_acc)
+        df["full_accuracy"] = np.nan
+        df.loc[list(full_ep), "full_accuracy"] = full_vals
+
     alpha = history.get("alpha", 0.0)
     df["alpha"] = alpha
     df.to_csv(csv_path, index=False)
@@ -57,6 +64,16 @@ def plot_training_curves(history, output_dir="training_output"):
 
         if key == "accuracy":
             plt.axhline(y=data[0], color="black", linestyle="--", label="Baseline")
+            if full_acc:
+                full_ep, full_vals = zip(*full_acc)
+                plt.plot(
+                    list(full_ep),
+                    list(full_vals),
+                    color="orange",
+                    marker="o",
+                    linestyle="",
+                    label="Full eval",
+                )
 
         plt.title(f"{title} (α={alpha:.3f})")
         plt.xlabel("Episode")

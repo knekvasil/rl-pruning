@@ -12,7 +12,7 @@ def analyze_pruning_policy(agent, env, device="cuda"):
     while not done:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
         with torch.no_grad():
-            action, _, _ = agent.act(obs_t)
+            action, _, _, _ = agent.act(obs_t)
 
         layer_idx = env.current_layer
         # Handle 2D action [ffn_ratio, head_ratio]

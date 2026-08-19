@@ -39,7 +39,12 @@ def main():
 
         print(f"Compression {c:.2f} → acc {acc:.4f}")
 
-    out_path = Path("../assets/baselines/tinybert_base_sst2_uniform.json")
+    out_path = (
+        Path(__file__).resolve().parents[2]
+        / "assets"
+        / "baselines"
+        / "bert_base_sst2_uniform.json"
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(out_path, "w") as f:

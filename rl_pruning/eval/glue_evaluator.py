@@ -46,3 +46,23 @@ class GLUEEvaluator:
                 total += labels.size(0)
 
         return correct / total
+
+    def evaluate_subset(self, model, indices, batch_size=32):
+        model.eval()
+        correct, total = 0, 0
+
+        with torch.no_grad():
+            for start in range(0, len(indices), batch_size):
+                chunk = indices[start : start + batch_size]
+                rows = [self.dataset[i] for i in chunk]
+                batch = {
+                    k: torch.stack([r[k] for r in rows]).to(self.device)
+                    for k in ["input_ids", "attention_mask", "label"]
+                }
+                labels = batch.pop("label")
+                outputs = model(**batch)
+                preds = outputs.logits.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+
+        return correct / total

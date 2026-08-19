@@ -8,7 +8,7 @@ def load_baseline_curve():
         Path(__file__).parent.parent
         / "assets"
         / "baselines"
-        / "tinybert_base_sst2_uniform.json"
+        / "bert_base_sst2_uniform.json"
     )
 
     with open(path) as f:
