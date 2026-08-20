@@ -280,25 +280,3 @@ def validate_environment(env, n_test_episodes=5):
 
     print(f"✓ Environment validated: {avg_compression:.1%} avg compression")
     return param_counts, accuracies, rewards
-
-
-# TODO: Fixed alphas...
-def tune_alpha_parameter(env, alpha_candidates=[0.01, 0.05, 0.1, 0.2, 0.5]):
-    print("=== Alpha Tuning ===")
-
-    results = {}
-    for alpha in alpha_candidates:
-        env.alpha = alpha
-        _, accs, _ = validate_environment(env, n_test_episodes=3)
-        results[alpha] = np.mean(accs)
-        print(f"α={alpha:.3f} → Avg Accuracy: {results[alpha]:.4f}")
-
-    # Choose alpha that maintains >90% of original accuracy
-    target_acc = 0.9 * env.original_accuracy
-    best_alpha = min(
-        [a for a, acc in results.items() if acc >= target_acc], default=0.05
-    )
-
-    print(f"✓ Selected α={best_alpha:.3f}")
-    env.alpha = best_alpha
-    return best_alpha
